@@ -1,0 +1,23 @@
+# AI Model
+model.h5
+
+# Dataset
+dataset/
+
+# Screenshots
+screenshots/
+screenshot_*.jpg
+
+# Database
+detections.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual env
+venv/
+env/
