@@ -12,18 +12,25 @@ import requests
 
 IMG_SIZE = 224
 CONFIDENCE_MIN = 90
+THRESHOLD = 92
 
 camera_running = True
 ai_paused = False
 
 prev_time = 0
 latest_frame = None
+frame_count = 0
 
 # Detection memory
 last_detected_label = None
 last_detection_time = 0
 
 DETECTION_COOLDOWN = 3
+
+# Stability detection
+stable_label = None
+stable_count = 0
+REQUIRED_STABLE_FRAMES = 7
 
 # ============================================================
 # CAMERA (SAFE INIT)
@@ -107,17 +114,27 @@ def generate_frames():
     global prev_time
     global camera_running
     global ai_paused
-
+    global frame_count
     global last_detected_label
     global last_detection_time
-
+    global stable_label
+    global stable_count
     global latest_frame
 
     while True:
 
-        # =========================
-        # CAMERA OFF STATE
-        # =========================
+        # ====================================================
+        # PROCESS EVERY 5TH FRAME
+        # ====================================================
+
+        frame_count += 1
+
+        if frame_count % 5 != 0:
+            continue
+
+        # ====================================================
+        # CAMERA OFF
+        # ====================================================
 
         if not camera_running:
             time.sleep(0.2)
@@ -128,9 +145,9 @@ def generate_frames():
         if not success or frame is None:
             continue
 
-        # =========================
-        # AI PAUSED MODE
-        # =========================
+        # ====================================================
+        # AI PAUSED
+        # ====================================================
 
         if ai_paused:
 
@@ -145,6 +162,7 @@ def generate_frames():
             )
 
             ret, buffer = cv2.imencode('.jpg', frame)
+
             frame = buffer.tobytes()
 
             yield (
@@ -156,9 +174,9 @@ def generate_frames():
 
             continue
 
-        # =========================
+        # ====================================================
         # AI PREDICTION
-        # =========================
+        # ====================================================
 
         processed = preprocess_frame(frame)
 
@@ -168,30 +186,52 @@ def generate_frames():
 
         confidence = float(predictions[class_id]) * 100
 
-        # ============================================================
-        # SMART DETECTION LOGIC
-        # ============================================================
-
-        THRESHOLD = 92
-
         predicted_label = (
             class_names[str(class_id)]
             if isinstance(class_names, dict)
             else class_names[class_id]
         )
 
+        # ====================================================
+        # STABLE REAL-TIME DETECTION
+        # ====================================================
+
         if confidence >= THRESHOLD:
-            label = predicted_label
+
+            # Same object repeatedly detected
+            if predicted_label == stable_label:
+
+                stable_count += 1
+
+            else:
+
+                stable_label = predicted_label
+                stable_count = 1
+
+            # Detect only after stable frames
+            if stable_count >= REQUIRED_STABLE_FRAMES:
+
+                label = predicted_label
+
+            else:
+
+                label = "No Object"
+
         else:
+
             label = "No Object"
+
+            stable_label = None
+            stable_count = 0
+            last_detected_label = None
+
+        # ====================================================
+        # UI SETTINGS
+        # ====================================================
 
         h, w, _ = frame.shape
 
         color = get_color(label)
-
-        # =========================
-        # FPS CALCULATION
-        # =========================
 
         current_time = time.time()
 
@@ -199,12 +239,13 @@ def generate_frames():
 
         prev_time = current_time
 
-        # =========================
-        # DRAW UI
-        # =========================
+        # ====================================================
+        # DRAW DETECTION
+        # ====================================================
 
-        if confidence >= CONFIDENCE_MIN:
+        if label != "No Object":
 
+            # Border
             cv2.rectangle(
                 frame,
                 (20, 20),
@@ -213,6 +254,7 @@ def generate_frames():
                 4
             )
 
+            # Top box
             cv2.rectangle(
                 frame,
                 (20, 20),
@@ -221,10 +263,8 @@ def generate_frames():
                 -1
             )
 
-            if label == "No Object":
-                text = label
-            else:
-                text = f"{label} ({confidence:.1f}%)"
+            # Detection text
+            text = f"{label} ({confidence:.1f}%)"
 
             cv2.putText(
                 frame,
@@ -236,16 +276,13 @@ def generate_frames():
                 3
             )
 
-            # ============================================================
+            # ====================================================
             # DETECT ONLY ONCE
-            # ============================================================
+            # ====================================================
 
             allow_detection = (
-                label != "No Object"
-                and (
-                    label != last_detected_label
-                    or (current_time - last_detection_time) > DETECTION_COOLDOWN
-                )
+                label != last_detected_label
+                or (current_time - last_detection_time) > DETECTION_COOLDOWN
             )
 
             if allow_detection:
@@ -259,7 +296,7 @@ def generate_frames():
 
             cv2.putText(
                 frame,
-                "Scanning...",
+                "No Object Detected",
                 (30, 60),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1,
@@ -267,9 +304,9 @@ def generate_frames():
                 2
             )
 
-        # =========================
+        # ====================================================
         # FPS + TIME
-        # =========================
+        # ====================================================
 
         cv2.putText(
             frame,
@@ -303,15 +340,15 @@ def generate_frames():
             2
         )
 
-        # =========================
+        # ====================================================
         # STORE FRAME
-        # =========================
+        # ====================================================
 
         latest_frame = frame.copy()
 
-        # =========================
+        # ====================================================
         # STREAM OUTPUT
-        # =========================
+        # ====================================================
 
         ret, buffer = cv2.imencode('.jpg', frame)
 
