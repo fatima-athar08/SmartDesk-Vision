@@ -11,102 +11,127 @@ import requests
 # ============================================================
 
 IMG_SIZE = 224
-CONFIDENCE_MIN = 90
-THRESHOLD = 92
+
+THRESHOLD             = 80    # minimum confidence % to consider a detection
+REQUIRED_STABLE_FRAMES = 5    # consecutive frames before confirming object
+DETECTION_COOLDOWN    = 5     # seconds before re-logging same object
+FRAME_SKIP            = 1     # process every 2nd frame (0 = every frame)
 
 camera_running = True
-ai_paused = False
+ai_paused      = False
 
-prev_time = 0
-latest_frame = None
-frame_count = 0
+prev_time      = 0
+latest_frame   = None
+frame_count    = 0
 
 # Detection memory
 last_detected_label = None
 last_detection_time = 0
 
-DETECTION_COOLDOWN = 3
+# Stability buffer  — rolling window instead of simple counter
+STABILITY_WINDOW = 7          # look at last N predictions
+stability_buffer = []         # stores recent predicted labels
 
-# Stability detection
-stable_label = None
-stable_count = 0
-REQUIRED_STABLE_FRAMES = 7
+# Ghost-phone suppression — phone needs higher bar
+PHONE_THRESHOLD = 88          # phone requires stricter confidence
 
 # ============================================================
-# CAMERA (SAFE INIT)
+# CAMERA  (try index 0 then 1)
 # ============================================================
 
 camera = cv2.VideoCapture(0)
 
 if not camera.isOpened():
+    camera = cv2.VideoCapture(1)
+
+if not camera.isOpened():
     print("❌ ERROR: Camera not accessible")
+else:
+    # Faster buffer — reduce latency
+    camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    camera.set(cv2.CAP_PROP_FPS, 30)
 
 # ============================================================
-# LOAD MODEL + CLASS NAMES
+# LOAD MODEL
 # ============================================================
+
+print("🚀 Loading AI Model...")
 
 model = tf.keras.models.load_model("model.h5")
 
 with open("class_names.json", "r") as f:
     class_names = json.load(f)
 
+print("✅ Model Loaded Successfully")
+
 # ============================================================
 # PREPROCESSING
 # ============================================================
 
 def preprocess_frame(frame):
-
     img = cv2.resize(frame, (IMG_SIZE, IMG_SIZE))
-    img = img / 255.0
+    img = img.astype("float32") / 255.0
     img = np.expand_dims(img, axis=0)
-
     return img
 
 # ============================================================
-# UI COLOR
+# UI COLORS
 # ============================================================
 
 def get_color(label):
-
-    if label == "phone":
-        return (0, 0, 255)
-
-    elif label == "mouse":
-        return (255, 0, 0)
-
-    elif label == "keyboard":
-        return (0, 255, 0)
-
-    elif label == "charger":
-        return (0, 255, 255)
-
-    elif label == "No Object":
-        return (150, 150, 150)
-
-    return (255, 255, 255)
+    colors = {
+        "phone":    (0,   0,   255),
+        "mouse":    (255, 0,   0  ),
+        "keyboard": (0,   255, 0  ),
+        "charger":  (0,   255, 255),
+        "No Object":(150, 150, 150),
+    }
+    return colors.get(label, (255, 255, 255))
 
 # ============================================================
-# LOGGING
+# LOG DETECTION
 # ============================================================
 
 def log_detection(label, confidence):
-
     try:
-
         requests.post(
             "http://127.0.0.1:5000/log",
             json={
-                "label": label,
+                "label":      label,
                 "confidence": float(confidence),
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
+                "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            },
+            timeout=1           # don't block the stream
         )
-
-    except:
+    except Exception:
         pass
 
 # ============================================================
-# MAIN STREAM GENERATOR
+# STABILITY HELPER  — majority vote over rolling window
+# ============================================================
+
+def get_stable_label(buffer):
+    """
+    Returns a label only if it appears in the majority of the
+    stability window, otherwise returns None.
+    """
+    if len(buffer) < STABILITY_WINDOW:
+        return None
+
+    from collections import Counter
+    counts = Counter(buffer)
+    top_label, top_count = counts.most_common(1)[0]
+
+    # Require majority (>50 %) of recent window
+    if top_count >= (STABILITY_WINDOW // 2 + 1):
+        return top_label
+
+    return None
+
+# ============================================================
+# MAIN VIDEO STREAM
 # ============================================================
 
 def generate_frames():
@@ -117,19 +142,20 @@ def generate_frames():
     global frame_count
     global last_detected_label
     global last_detection_time
-    global stable_label
-    global stable_count
+    global stability_buffer
     global latest_frame
 
     while True:
 
         # ====================================================
-        # PROCESS EVERY 5TH FRAME
+        # FRAME SKIP  (keeps webcam buffer fresh)
         # ====================================================
 
         frame_count += 1
 
-        if frame_count % 5 != 0:
+        if frame_count % (FRAME_SKIP + 1) != 0:
+            # Still grab the frame so the camera buffer doesn't fill up
+            camera.grab()
             continue
 
         # ====================================================
@@ -137,7 +163,7 @@ def generate_frames():
         # ====================================================
 
         if not camera_running:
-            time.sleep(0.2)
+            time.sleep(0.1)
             continue
 
         success, frame = camera.read()
@@ -146,45 +172,39 @@ def generate_frames():
             continue
 
         # ====================================================
-        # AI PAUSED
+        # FPS
+        # ====================================================
+
+        current_time = time.time()
+        fps = 1 / (current_time - prev_time) if prev_time else 0
+        prev_time = current_time
+
+        # ====================================================
+        # AI PAUSED  — stream raw frame with overlay
         # ====================================================
 
         if ai_paused:
 
             cv2.putText(
-                frame,
-                "AI DETECTION PAUSED",
-                (30, 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 0, 255),
-                3
+                frame, "AI DETECTION PAUSED",
+                (30, 60), cv2.FONT_HERSHEY_SIMPLEX,
+                1, (0, 0, 255), 3
             )
 
-            ret, buffer = cv2.imencode('.jpg', frame)
+            _draw_fps_time(frame, fps)
 
-            frame = buffer.tobytes()
-
-            yield (
-                b'--frame\r\n'
-                b'Content-Type: image/jpeg\r\n\r\n' +
-                frame +
-                b'\r\n'
-            )
-
+            ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            yield _mjpeg(buffer.tobytes())
             continue
 
         # ====================================================
         # AI PREDICTION
         # ====================================================
 
-        processed = preprocess_frame(frame)
-
+        processed   = preprocess_frame(frame)
         predictions = model.predict(processed, verbose=0)[0]
-
-        class_id = int(np.argmax(predictions))
-
-        confidence = float(predictions[class_id]) * 100
+        class_id    = int(np.argmax(predictions))
+        confidence  = float(predictions[class_id]) * 100
 
         predicted_label = (
             class_names[str(class_id)]
@@ -193,170 +213,134 @@ def generate_frames():
         )
 
         # ====================================================
-        # STABLE REAL-TIME DETECTION
+        # PER-CLASS THRESHOLD  (phone needs higher confidence)
         # ====================================================
 
-        if confidence >= THRESHOLD:
+        effective_threshold = (
+            PHONE_THRESHOLD
+            if predicted_label == "phone"
+            else THRESHOLD
+        )
 
-            # Same object repeatedly detected
-            if predicted_label == stable_label:
+        raw_label = (
+            predicted_label
+            if confidence >= effective_threshold
+            else "No Object"
+        )
 
-                stable_count += 1
+        # ====================================================
+        # ROLLING STABILITY BUFFER
+        # ====================================================
 
-            else:
+        stability_buffer.append(raw_label)
 
-                stable_label = predicted_label
-                stable_count = 1
+        if len(stability_buffer) > STABILITY_WINDOW:
+            stability_buffer.pop(0)
 
-            # Detect only after stable frames
-            if stable_count >= REQUIRED_STABLE_FRAMES:
+        stable = get_stable_label(stability_buffer)
 
-                label = predicted_label
+        # Only accept a real object from the stable vote
+        label = stable if (stable and stable != "No Object") else "No Object"
 
-            else:
+        # ====================================================
+        # GHOST DETECTION GUARD
+        # — if majority is "No Object", hard-reset
+        # ====================================================
 
-                label = "No Object"
+        no_obj_count = stability_buffer.count("No Object")
 
-        else:
-
+        if no_obj_count >= (STABILITY_WINDOW // 2 + 1):
             label = "No Object"
-
-            stable_label = None
-            stable_count = 0
-            last_detected_label = None
+            last_detected_label = None   # allow fresh detection next time
 
         # ====================================================
-        # UI SETTINGS
-        # ====================================================
-
-        h, w, _ = frame.shape
-
-        color = get_color(label)
-
-        current_time = time.time()
-
-        fps = 1 / (current_time - prev_time) if prev_time else 0
-
-        prev_time = current_time
-
-        # ====================================================
-        # DRAW DETECTION
+        # LOG  — once per appearance, then cooldown
         # ====================================================
 
         if label != "No Object":
 
-            # Border
-            cv2.rectangle(
-                frame,
-                (20, 20),
-                (w - 20, h - 20),
-                color,
-                4
-            )
-
-            # Top box
-            cv2.rectangle(
-                frame,
-                (20, 20),
-                (420, 80),
-                color,
-                -1
-            )
-
-            # Detection text
-            text = f"{label} ({confidence:.1f}%)"
-
-            cv2.putText(
-                frame,
-                text,
-                (30, 65),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 0, 0),
-                3
-            )
-
-            # ====================================================
-            # DETECT ONLY ONCE
-            # ====================================================
-
-            allow_detection = (
+            allow_log = (
                 label != last_detected_label
                 or (current_time - last_detection_time) > DETECTION_COOLDOWN
             )
 
-            if allow_detection:
-
+            if allow_log:
                 log_detection(label, confidence)
-
                 last_detected_label = label
                 last_detection_time = current_time
+
+        # ====================================================
+        # DRAW UI
+        # ====================================================
+
+        h, w, _ = frame.shape
+        color    = get_color(label)
+
+        if label != "No Object":
+
+            # Outer border
+            cv2.rectangle(frame, (20, 20), (w - 20, h - 20), color, 4)
+
+            # Label background
+            cv2.rectangle(frame, (20, 20), (460, 80), color, -1)
+
+            # Label text
+            cv2.putText(
+                frame,
+                f"{label.upper()} ({confidence:.1f}%)",
+                (30, 65),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 3
+            )
 
         else:
 
             cv2.putText(
-                frame,
-                "No Object Detected",
-                (30, 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (200, 200, 200),
-                2
+                frame, "No Object Detected",
+                (30, 60), cv2.FONT_HERSHEY_SIMPLEX,
+                1, (180, 180, 180), 2
             )
 
-        # ====================================================
-        # FPS + TIME
-        # ====================================================
-
-        cv2.putText(
-            frame,
-            f"FPS: {int(fps)}",
-            (30, h - 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 255),
-            2
-        )
-
-        timestamp = datetime.now().strftime("%H:%M:%S")
-
-        cv2.putText(
-            frame,
-            timestamp,
-            (w - 150, h - 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 255),
-            2
-        )
-
-        cv2.putText(
-            frame,
-            "SmartDesk Vision AI",
-            (30, h - 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            color,
-            2
-        )
+        _draw_fps_time(frame, fps)
 
         # ====================================================
-        # STORE FRAME
+        # STORE + STREAM
         # ====================================================
 
         latest_frame = frame.copy()
 
-        # ====================================================
-        # STREAM OUTPUT
-        # ====================================================
+        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        yield _mjpeg(buffer.tobytes())
 
-        ret, buffer = cv2.imencode('.jpg', frame)
+# ============================================================
+# HELPERS
+# ============================================================
 
-        frame = buffer.tobytes()
+def _draw_fps_time(frame, fps):
+    h, w = frame.shape[:2]
 
-        yield (
-            b'--frame\r\n'
-            b'Content-Type: image/jpeg\r\n\r\n' +
-            frame +
-            b'\r\n'
-        )
+    cv2.putText(
+        frame, f"FPS: {int(fps)}",
+        (30, h - 20), cv2.FONT_HERSHEY_SIMPLEX,
+        0.8, (255, 255, 255), 2
+    )
+
+    cv2.putText(
+        frame, datetime.now().strftime("%H:%M:%S"),
+        (w - 150, h - 20), cv2.FONT_HERSHEY_SIMPLEX,
+        0.8, (255, 255, 255), 2
+    )
+
+    cv2.putText(
+        frame, "SmartDesk Vision AI",
+        (30, h - 60), cv2.FONT_HERSHEY_SIMPLEX,
+        0.8, (255, 255, 255), 2
+    )
+
+
+def _mjpeg(frame_bytes):
+    return (
+        b'--frame\r\n'
+        b'Content-Type: image/jpeg\r\n\r\n' +
+        frame_bytes +
+        b'\r\n'
+    )
